@@ -2,14 +2,17 @@ import os, json, time, sqlite3, logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import requests
-from openai import OpenAI
+
 
 logging.basicConfig(level=logging.INFO)
 TZ=ZoneInfo("Asia/Taipei")
 TOKEN=os.environ["TELEGRAM_BOT_TOKEN"]
 OWNER=int(os.environ.get("TELEGRAM_OWNER_ID","0"))
-client=OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=30)
-MODEL=os.environ.get("OPENAI_MODEL","gpt-4.1-mini")
+GEMINI_KEY=os.environ["GEMINI_API_KEY"].strip()
+if not GEMINI_KEY:
+    raise RuntimeError("GEMINI_API_KEY is empty")
+# This model has a free tier. Use a no-billing AI Studio project to avoid charges.
+MODEL=os.environ.get("GEMINI_MODEL","gemini-2.5-flash-lite")
 DB=os.environ.get("DB_PATH","/data/secretary.db")
 os.makedirs(os.path.dirname(DB) or ".",exist_ok=True)
 BASE="https://api.telegram.org/bot"+TOKEN
@@ -52,9 +55,31 @@ def think(text):
 done 只接受使用者指定的任務編號，否則追問。一般問題用 chat。
 reply 不可假稱已成功新增或完成；程式會確認。請簡潔、有幫助地回答。"""
     with db() as c: rows=c.execute("SELECT role,content FROM history ORDER BY id DESC LIMIT 10").fetchall()
-    msgs=[{"role":"system","content":system}]+[{"role":r["role"],"content":r["content"]} for r in reversed(rows)]+[{"role":"user","content":text}]
-    ans=client.chat.completions.create(model=MODEL,messages=msgs,response_format={"type":"json_object"},temperature=0.2,max_tokens=500)
-    return json.loads(ans.choices[0].message.content)
+    # Convert saved OpenAI-format chat history to Gemini's role/parts format.
+    contents=[]
+    for row in reversed(rows):
+        role="model" if row["role"]=="assistant" else "user"
+        contents.append({"role":role,"parts":[{"text":row["content"]}]})
+    contents.append({"role":"user","parts":[{"text":text}]})
+    url=f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+    payload={
+        "systemInstruction":{"parts":[{"text":system}]},
+        "contents":contents,
+        "generationConfig":{"responseMimeType":"application/json","temperature":0.2,"maxOutputTokens":900}
+    }
+    response=http.post(url,headers={"x-goog-api-key":GEMINI_KEY,"Content-Type":"application/json"},json=payload,timeout=40)
+    if response.status_code==429:
+        raise RuntimeError("GEMINI_FREE_LIMIT")
+    if response.status_code in (401,403):
+        raise RuntimeError("GEMINI_KEY_INVALID")
+    response.raise_for_status()
+    data=response.json()
+    candidates=data.get("candidates") or []
+    if not candidates:
+        raise RuntimeError("GEMINI_NO_RESPONSE")
+    parts=candidates[0].get("content",{}).get("parts",[])
+    answer="".join(part.get("text","") for part in parts)
+    return json.loads(answer)
 def message(cid,txt):
     if txt=="/start":
         send(cid,"你好！我是你的 AI 私人小秘書 💙\n直接問我問題，或說「明天下午三點提醒我打給廠商」。\n/list 查看待辦；/help 看指令。");return
@@ -88,9 +113,14 @@ def message(cid,txt):
         else:reply=str(result.get("reply") or "可以再說詳細一點嗎？")
         send(cid,reply)
         record("user",txt);record("assistant",reply)
-    except Exception:
+    except Exception as exc:
         logging.exception("AI error")
-        send(cid,"抱歉，AI 暫時無法回答，已排定的提醒仍會繼續嘗試發送。")
+        if str(exc)=="GEMINI_FREE_LIMIT":
+            send(cid,"Gemini 免費使用額度暫時用完了。請稍後再問，不需要付費升級；已設定提醒仍會嘗試照常發送。")
+        elif str(exc)=="GEMINI_KEY_INVALID":
+            send(cid,"Gemini API 金鑰無效或沒有權限，請檢查金鑰設定。")
+        else:
+            send(cid,"抱歉，AI 暫時無法回答，已排定的提醒仍會繼續嘗試發送。")
 def callback(q):
     if not OWNER or q["from"]["id"]!=OWNER or q["message"]["chat"]["id"]!=OWNER:return
     action,_,raw=q.get("data","").partition(":")
