@@ -19,7 +19,7 @@ bot.http.post=fake_post
 result=bot.think("每月15號11點提醒繳費，每月26號11點買eSIM")
 assert isinstance(result,dict),result
 assert len(result["actions"])==2,result
-assert "已新增" in bot.add_monthly(result["actions"][0])
+assert "新增每月提醒" in bot.add_monthly(result["actions"][0])
 assert "已設定過" in bot.add_monthly(result["actions"][0])
 assert bot.monthly_status()
 print("Secretary offline smoke tests passed")
