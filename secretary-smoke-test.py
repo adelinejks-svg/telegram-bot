@@ -23,3 +23,25 @@ assert "新增每月提醒" in bot.add_monthly(result["actions"][0])
 assert "已設定過" in bot.add_monthly(result["actions"][0])
 assert bot.monthly_status()
 print("Secretary offline smoke tests passed")
+
+
+# No external network: verify all three quote types and concise analysis.
+class PriceResponse:
+    status_code=200
+    def __init__(self,body):self.body=body
+    def raise_for_status(self): pass
+    def json(self):return self.body
+def fake_get(url,**kwargs):
+    if "frankfurter" in url:
+        return PriceResponse({"rate":31.25,"date":"2026-11-11"})
+    if url.endswith("/XAU"):
+        return PriceResponse({"price":4000,"updatedAt":"2026-11-12T01:00:00Z"})
+    if url.endswith("/BTC"):
+        return PriceResponse({"price":74000,"updatedAt":"2026-11-12T01:00:00Z"})
+    raise AssertionError(url)
+bot.http.get=fake_get
+market=bot.daily_market_report()
+assert "31.250" in market and "4,000.00" in market and "74,000.00" in market,market
+assert "簡短分析" in market,market
+assert bot.market_time()=="09:00"
+print("Market digest smoke tests passed")
