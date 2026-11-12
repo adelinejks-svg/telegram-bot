@@ -98,7 +98,7 @@ def think(text):
         raise RuntimeError("GEMINI_KEY_NOT_CONFIGURED")
     system=f"""你是繁體中文私人小秘書。台灣現在時間為 {stamp(now())}。使用者待辦：\n{agenda()}\n每月固定提醒：\n{monthly_agenda()}\n
 回覆唯一 JSON 物件：action(add/list/done/chat/monthly),reply,title,due,important,id,day,hour,minute。
-如一次要求新增多個每月事項，請輸出 {"actions":[{"action":"monthly","day":15,"hour":11,"minute":0,"title":"..."},{"action":"monthly","day":26,"hour":11,"minute":0,"title":"..."}]}，不能輸出最外層 JSON 陣列。
+如一次要求新增多個每月事項，請輸出 {{"actions":[{{"action":"monthly","day":15,"hour":11,"minute":0,"title":"..."}},{{"action":"monthly","day":26,"hour":11,"minute":0,"title":"..."}}]}}，不能輸出最外層 JSON 陣列。
 討論現有提醒的時間、是否持續催辦、說「有說11點」都不是新增提醒，請用 chat 回答，不要追問已知道的時間。
 明確要求「每月」「每個月」固定提醒時用 monthly，day=1..28 或 29..31，hour=0..23，minute=0..59。
 若包含多個月度事項，可合併為一個提醒標題；不確定日期時間就用 chat 追問。
@@ -149,7 +149,15 @@ def message(cid,txt):
     if txt=="/start":
         send(cid,"你好！我是你的 AI 私人小秘書 💙\n直接問我問題，或說「明天下午三點提醒我打給廠商」。\n/list 查看待辦；/help 看指令。");return
     if txt=="/help":
-        send(cid,"/list 查行程\n/monthly 查每月提醒\n/monthlyadd 15 11 繳停車費  新增每月15號11點提醒\n/monthlydelete 10001  刪除每月提醒\n/done 3 完成編號3的事項\n/id 查 Telegram ID\n重要單次提醒每30分鐘催辦直到完成。");return
+        send(cid,"/list 查行程\n/monthly 查每月提醒\n/test 即時推播測試\n/testremind 1分鐘後推播測試\n/monthlyadd 15 11 繳停車費  新增每月15號11點提醒\n/monthlydelete 10001  刪除每月提醒\n/done 3 完成編號3的事項\n/id 查 Telegram ID\n重要單次提醒每30分鐘催辦直到完成。");return
+    if txt=="/test":
+        send(cid,"✅ Telegram 推播測試成功！這則訊息不需要 Gemini，也不會新增待辦。");return
+    if txt=="/testremind":
+        due=now()+timedelta(minutes=1)
+        with db() as c:
+            n=c.execute("INSERT INTO tasks(title,due,important) VALUES(?,?,0)",
+                        ("🔔 一分鐘後提醒測試（只發送一次）",stamp(due))).lastrowid
+        send(cid,f"✅ 測試提醒已排定，約一分鐘後推播。編號 #{n}");return
     if txt=="/monthly":
         send(cid,"📅 每月固定提醒\n"+monthly_status());return
     if any(p in txt for p in ("沒有完成","沒完成","持續提醒","一直提醒","繼續提醒")):
