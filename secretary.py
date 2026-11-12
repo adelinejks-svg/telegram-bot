@@ -8,9 +8,7 @@ logging.basicConfig(level=logging.INFO)
 TZ=ZoneInfo("Asia/Taipei")
 TOKEN=os.environ["TELEGRAM_BOT_TOKEN"]
 OWNER=int(os.environ.get("TELEGRAM_OWNER_ID","0"))
-GEMINI_KEY=os.environ["GEMINI_API_KEY"].strip()
-if not GEMINI_KEY:
-    raise RuntimeError("GEMINI_API_KEY is empty")
+GEMINI_KEY=os.environ.get("GEMINI_API_KEY","").strip()
 # This model has a free tier. Use a no-billing AI Studio project to avoid charges.
 MODEL=os.environ.get("GEMINI_MODEL","gemini-2.5-flash-lite")
 DB=os.environ.get("DB_PATH","/data/secretary.db")
@@ -49,6 +47,8 @@ def record(role,content):
         c.execute("INSERT INTO history(role,content) VALUES(?,?)",(role,content[:1200]))
         c.execute("DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY id DESC LIMIT 12)")
 def think(text):
+    if not GEMINI_KEY:
+        raise RuntimeError("GEMINI_KEY_NOT_CONFIGURED")
     system=f"""你是繁體中文私人小秘書。台灣現在時間為 {stamp(now())}。使用者待辦：\n{agenda()}\n
 回覆唯一 JSON：action(add/list/done/chat),reply,title,due,important,id。
 只有使用者明確要設定提醒且有具體日期及時間才用 add；due 必須 ISO 8601 加 +08:00。缺時間就用 chat 追問，絕不猜時間。
@@ -115,7 +115,9 @@ def message(cid,txt):
         record("user",txt);record("assistant",reply)
     except Exception as exc:
         logging.exception("AI error")
-        if str(exc)=="GEMINI_FREE_LIMIT":
+        if str(exc)=="GEMINI_KEY_NOT_CONFIGURED":
+            send(cid,"我已經改成 Gemini，但還沒設定 Gemini API 金鑰。請先到 Railway 安全設定 GEMINI_API_KEY。")
+        elif str(exc)=="GEMINI_FREE_LIMIT":
             send(cid,"Gemini 免費使用額度暫時用完了。請稍後再問，不需要付費升級；已設定提醒仍會嘗試照常發送。")
         elif str(exc)=="GEMINI_KEY_INVALID":
             send(cid,"Gemini API 金鑰無效或沒有權限，請檢查金鑰設定。")
