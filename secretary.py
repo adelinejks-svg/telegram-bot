@@ -36,6 +36,11 @@ def init():
         # Stable keys mean restarts and deployments never duplicate them.
         c.execute("INSERT OR IGNORE INTO monthly(id,title,day,hour,minute) VALUES(10001,'繳停車費、ETC、查詢罰單、繳電話費',15,11,0)")
         c.execute("INSERT OR IGNORE INTO monthly(id,title,day,hour,minute) VALUES(10002,'購買 eSIM',26,11,0)")
+        c.execute("""CREATE TABLE IF NOT EXISTS monthly_occurrences(
+            monthly_id INTEGER NOT NULL, period TEXT NOT NULL,
+            sent_at TEXT, done_at TEXT, snooze_until TEXT,
+            PRIMARY KEY(monthly_id,period)
+        )""")
 def api(method, data):
     r=http.post(BASE+"/"+method,json=data,timeout=35)
     r.raise_for_status()
@@ -55,6 +60,35 @@ def monthly_agenda():
     with db() as c:
         rows=c.execute("SELECT * FROM monthly WHERE enabled=1 ORDER BY day,hour,minute,id").fetchall()
     return "\n".join(f"📅 每月{r['day']}號 {r['hour']:02d}:{r['minute']:02d} #{r['id']} {r['title']}" for r in rows) or "目前沒有每月固定提醒。"
+def monthly_status():
+    month=now().strftime("%Y-%m")
+    with db() as c:
+        rules=c.execute("SELECT * FROM monthly WHERE enabled=1 ORDER BY day,id").fetchall()
+        result=[]
+        for r in rules:
+            occ=c.execute("SELECT done_at FROM monthly_occurrences WHERE monthly_id=? AND period=?",(r["id"],month)).fetchone()
+            done="✅ 本月已完成" if occ and occ["done_at"] else "🔔 未完成會每30分鐘提醒"
+            result.append(f"每月{r['day']}號 {r['hour']:02d}:{r['minute']:02d} #{r['id']} {r['title']}｜{done}")
+    return "\n".join(result) or "沒有每月固定提醒。"
+
+def add_monthly(item):
+    try:
+        day=int(item.get("day") or 0)
+        hour=int(item.get("hour") if item.get("hour") is not None else -1)
+        minute=int(item.get("minute") or 0)
+        title=str(item.get("title") or "").strip()[:200]
+        if not (1<=day<=28 and 0<=hour<=23 and 0<=minute<=59 and title):
+            return "請提供每月幾號、幾點與提醒事項。"
+        with db() as c:
+            rows=c.execute("SELECT * FROM monthly WHERE day=? AND hour=? AND minute=? AND enabled=1",(day,hour,minute)).fetchall()
+            for r in rows:
+                if title==r["title"] or title in r["title"] or r["title"] in title:
+                    return f"✅ 已設定過 #{r['id']}：{r['title']}，不會重複建立。"
+            rid=c.execute("INSERT INTO monthly(title,day,hour,minute) VALUES(?,?,?,?)",(title,day,hour,minute)).lastrowid
+        return f"✅ 新增每月提醒 #{rid}：每月{day}號 {hour:02d}:{minute:02d} {title}"
+    except (TypeError,ValueError):
+        return "請提供確定的日期與時間。"
+
 def record(role,content):
     with db() as c:
         c.execute("INSERT INTO history(role,content) VALUES(?,?)",(role,content[:1200]))
@@ -63,7 +97,9 @@ def think(text):
     if not GEMINI_KEY:
         raise RuntimeError("GEMINI_KEY_NOT_CONFIGURED")
     system=f"""你是繁體中文私人小秘書。台灣現在時間為 {stamp(now())}。使用者待辦：\n{agenda()}\n每月固定提醒：\n{monthly_agenda()}\n
-回覆唯一 JSON：action(add/list/done/chat/monthly),reply,title,due,important,id,day,hour,minute。
+回覆唯一 JSON 物件：action(add/list/done/chat/monthly),reply,title,due,important,id,day,hour,minute。
+如一次要求新增多個每月事項，請輸出 {"actions":[{"action":"monthly","day":15,"hour":11,"minute":0,"title":"..."},{"action":"monthly","day":26,"hour":11,"minute":0,"title":"..."}]}，不能輸出最外層 JSON 陣列。
+討論現有提醒的時間、是否持續催辦、說「有說11點」都不是新增提醒，請用 chat 回答，不要追問已知道的時間。
 明確要求「每月」「每個月」固定提醒時用 monthly，day=1..28 或 29..31，hour=0..23，minute=0..59。
 若包含多個月度事項，可合併為一個提醒標題；不確定日期時間就用 chat 追問。
 已存在的每月提醒不要重複建立；若使用者問有哪些固定提醒，請用 list。
@@ -103,14 +139,23 @@ reply 不可假稱已成功新增或完成；程式會確認。請簡潔、有�
         raise RuntimeError("GEMINI_NO_RESPONSE")
     parts=candidates[0].get("content",{}).get("parts",[])
     answer="".join(part.get("text","") for part in parts)
-    return json.loads(answer)
+    parsed=json.loads(answer)
+    if isinstance(parsed,list):
+        parsed={"actions":parsed}
+    if not isinstance(parsed,dict):
+        raise RuntimeError("GEMINI_UNEXPECTED_RESPONSE")
+    return parsed
 def message(cid,txt):
     if txt=="/start":
         send(cid,"你好！我是你的 AI 私人小秘書 💙\n直接問我問題，或說「明天下午三點提醒我打給廠商」。\n/list 查看待辦；/help 看指令。");return
     if txt=="/help":
         send(cid,"/list 查行程\n/monthly 查每月提醒\n/monthlyadd 15 11 繳停車費  新增每月15號11點提醒\n/monthlydelete 10001  刪除每月提醒\n/done 3 完成編號3的事項\n/id 查 Telegram ID\n重要單次提醒每30分鐘催辦直到完成。");return
     if txt=="/monthly":
-        send(cid,"📅 每月固定提醒\n"+monthly_agenda());return
+        send(cid,"📅 每月固定提醒\n"+monthly_status());return
+    if any(p in txt for p in ("沒有完成","沒完成","持續提醒","一直提醒","繼續提醒")):
+        send(cid,"好的，已設定每月固定提醒在11:00開始，未完成每30分鐘催辦，直到按「✅ 本月完成」；次月仍照常提醒。\n"+monthly_status());return
+    if txt in ("有說11點啊","有說11點","11點啊","11點","上午11點","大概11點"):
+        send(cid,"對，早就設定上午11點了，不用再說一次。\n"+monthly_status());return
     if txt.startswith("/monthlyadd "):
         try:
             parts=txt.split(maxsplit=3)
@@ -145,7 +190,15 @@ def message(cid,txt):
         except Exception:send(cid,"請輸入 /done 3")
         return
     try:
-        result=think(txt);action=result.get("action","chat")
+        result=think(txt)
+        if isinstance(result.get("actions"),list):
+            replies=[add_monthly(item) for item in result["actions"][:10]
+                     if isinstance(item,dict) and item.get("action")=="monthly"]
+            reply="\n".join(replies) or str(result.get("reply") or "可以再說詳細一點嗎？")
+            send(cid,reply)
+            record("user",txt);record("assistant",reply)
+            return
+        action=result.get("action","chat")
         if action=="add":
             due=datetime.fromisoformat(str(result["due"])).astimezone(TZ)
             title=str(result.get("title","")).strip()[:200]
@@ -157,20 +210,7 @@ def message(cid,txt):
             reply=f"✅ 已新增 #{n}\n{title}\n🕒 {due:%Y/%m/%d %H:%M}（台灣）"
             if important:reply+="\n❗重要提醒將每30分鐘再次通知，直到確認完成。"
         elif action=="monthly":
-            day=int(result.get("day") or 0)
-            hour=int(result.get("hour") if result.get("hour") is not None else -1)
-            minute=int(result.get("minute") or 0)
-            title=str(result.get("title") or "").strip()[:200]
-            if not (1<=day<=28 and 0<=hour<=23 and 0<=minute<=59 and title):
-                reply="請告訴我每月幾號、幾點，以及要提醒的事情。（目前支援1至28號）"
-            else:
-                with db() as c:
-                    existing=c.execute("SELECT id FROM monthly WHERE title=? AND day=? AND hour=? AND minute=? AND enabled=1",(title,day,hour,minute)).fetchone()
-                    if existing:
-                        reply=f"這個每月提醒已經存在（#{existing['id']}），不會重複新增。"
-                    else:
-                        cur=c.execute("INSERT INTO monthly(title,day,hour,minute) VALUES(?,?,?,?)",(title,day,hour,minute))
-                        reply=f"✅ 已設定每月{day}號 {hour:02d}:{minute:02d}（台灣時間）提醒：{title}（#{cur.lastrowid}）"
+            reply=add_monthly(result)
         elif action=="list":reply="📋 未完成事項\n"+agenda()+"\n\n"+monthly_agenda()
         elif action=="done":
             n=int(result.get("id") or 0)
@@ -196,6 +236,25 @@ def callback(q):
     action,_,raw=q.get("data","").partition(":")
     try:
         task=int(raw)
+        if action in ("mdone","mlater"):
+            period=now().strftime("%Y-%m")
+            with db() as c:
+                r=c.execute("SELECT id FROM monthly WHERE id=? AND enabled=1",(task,)).fetchone()
+                if not r:
+                    msg="找不到這筆每月提醒"
+                elif action=="mdone":
+                    c.execute("""INSERT INTO monthly_occurrences(monthly_id,period,done_at)
+                        VALUES(?,?,?) ON CONFLICT(monthly_id,period) DO UPDATE SET done_at=excluded.done_at""",
+                        (task,period,stamp(now())))
+                    msg="✅ 本月完成，這個月停止催辦，下個月仍會提醒。"
+                else:
+                    c.execute("""INSERT INTO monthly_occurrences(monthly_id,period,snooze_until)
+                        VALUES(?,?,?) ON CONFLICT(monthly_id,period) DO UPDATE SET snooze_until=excluded.snooze_until""",
+                        (task,period,stamp(now()+timedelta(minutes=30))))
+                    msg="⏰ 30分鐘後繼續提醒"
+            api("answerCallbackQuery",{"callback_query_id":q["id"],"text":msg})
+            send(OWNER,msg)
+            return
         with db() as c:
             if action=="done":
                 res=c.execute("UPDATE tasks SET done=1 WHERE id=? AND done=0",(task,))
@@ -214,23 +273,32 @@ def scheduler():
         if t.hour>=8 and (not v or v["v"]!=t.strftime("%Y-%m-%d")):
             send(OWNER,"🌞 今日待辦總覽\n"+agenda())
             c.execute("INSERT INTO state(k,v) VALUES('daily',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",(t.strftime("%Y-%m-%d"),))
-    # Monthly reminders run independently from Gemini API.
-    # Do not mark as sent until Telegram confirms delivery.
+    # Persist a separate occurrence for each calendar month, independent of Gemini.
+    period=t.strftime("%Y-%m")
     with db() as c:
-        monthlies=c.execute("SELECT * FROM monthly WHERE enabled=1 ORDER BY id").fetchall()
-    current_month=t.strftime("%Y-%m")
-    for r in monthlies:
-        if r["sent_month"]==current_month:
-            continue
-        if (t.day,t.hour,t.minute)<(r["day"],r["hour"],r["minute"]):
-            continue
-        # Avoid a newly deployed service sending old monthly reminders days late.
-        if t.day!=r["day"] or t.hour!=r["hour"]:
+        rules=c.execute("SELECT * FROM monthly WHERE enabled=1 ORDER BY id").fetchall()
+        for r in rules:
+            due=t.replace(day=r["day"],hour=r["hour"],minute=r["minute"],second=0,microsecond=0)
+            if t>=due:
+                c.execute("INSERT OR IGNORE INTO monthly_occurrences(monthly_id,period) VALUES(?,?)",(r["id"],period))
+        occurrences=c.execute("""SELECT o.*,m.title,m.day,m.hour,m.minute FROM monthly_occurrences o
+            JOIN monthly m ON m.id=o.monthly_id
+            WHERE m.enabled=1 AND o.done_at IS NULL
+            ORDER BY o.period,o.monthly_id""").fetchall()
+    for occ in occurrences:
+        due=datetime.fromisoformat(f"{occ['period']}-{occ['day']:02d}T{occ['hour']:02d}:{occ['minute']:02d}:00+08:00")
+        if t<due:continue
+        last=datetime.fromisoformat(occ["sent_at"]) if occ["sent_at"] else None
+        snooze=datetime.fromisoformat(occ["snooze_until"]) if occ["snooze_until"] else None
+        if (last and t-last<timedelta(minutes=30)) or (snooze and t<snooze):
             continue
         try:
-            send(OWNER,f"📅 每月固定提醒\n{r['title']}\n每月{r['day']}號 {r['hour']:02d}:{r['minute']:02d}（台灣時間）")
+            send(OWNER,f"🔔 每月固定提醒（{occ['period']}）\n{occ['title']}\n沒完成就每30分鐘繼續提醒。",[
+                [{"text":"✅ 本月完成","callback_data":f"mdone:{occ['monthly_id']}"},
+                 {"text":"⏰ 30分鐘後","callback_data":f"mlater:{occ['monthly_id']}"}]])
             with db() as c:
-                c.execute("UPDATE monthly SET sent_month=? WHERE id=?",(current_month,r["id"]))
+                c.execute("UPDATE monthly_occurrences SET sent_at=? WHERE monthly_id=? AND period=?",
+                          (stamp(t),occ["monthly_id"],occ["period"]))
         except Exception:
             logging.exception("Monthly reminder failed")
     for r in pending():
