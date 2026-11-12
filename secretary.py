@@ -1,4 +1,4 @@
-import os, json, time, sqlite3, logging
+import os, json, time, sqlite3, logging, re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import requests
@@ -27,6 +27,8 @@ def init():
         c.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, due TEXT NOT NULL, important INTEGER DEFAULT 0, sent TEXT, done INTEGER DEFAULT 0)")
         c.execute("CREATE TABLE IF NOT EXISTS state (k TEXT PRIMARY KEY, v TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, role TEXT, content TEXT)")
+        c.execute("INSERT OR IGNORE INTO state(k,v) VALUES('market_time','09:00')")
+        c.execute("INSERT OR IGNORE INTO state(k,v) VALUES('market_enabled','1')")
         c.execute("""CREATE TABLE IF NOT EXISTS monthly (
             id INTEGER PRIMARY KEY, title TEXT NOT NULL, day INTEGER NOT NULL,
             hour INTEGER NOT NULL, minute INTEGER NOT NULL DEFAULT 0,
@@ -89,6 +91,72 @@ def add_monthly(item):
     except (TypeError,ValueError):
         return "請提供確定的日期與時間。"
 
+
+def market_time():
+    with db() as c:
+        r=c.execute("SELECT v FROM state WHERE k='market_time'").fetchone()
+    return r["v"] if r else "09:00"
+
+def daily_market_report():
+    """Deterministic market commentary; no chargeable AI call or invented quotes."""
+    lines=[f"📈 每日市場晨報｜{now():%Y/%m/%d %H:%M}（台灣）"]
+    values={}
+    sources=[]
+    try:
+        r=http.get("https://api.frankfurter.dev/v2/rate/USD/TWD",timeout=12)
+        r.raise_for_status()
+        d=r.json()
+        value=float(d["rate"])
+        if value<=0:raise ValueError("invalid USD/TWD")
+        values["USD/TWD"]=value
+        lines.append(f"💵 美元兌台幣：1 USD = NT$ {value:.3f}（參考中間價；資料日 {d.get('date','未提供')}）")
+        sources.append("Frankfurter")
+    except Exception:
+        logging.exception("USD/TWD market price fetch failed")
+        lines.append("💵 美元兌台幣：暫時無法取得（不顯示推測價格）")
+    for symbol,label in (("XAU","🥇 黃金"),("BTC","₿ 比特幣")):
+        try:
+            r=http.get("https://api.gold-api.com/price/"+symbol,timeout=12)
+            r.raise_for_status()
+            d=r.json()
+            value=float(d["price"])
+            if value<=0:raise ValueError("invalid price")
+            values[symbol]=value
+            unit="每金衡盎司" if symbol=="XAU" else "每枚"
+            updated=d.get("updatedAt","未提供")
+            lines.append(f"{label}：US$ {value:,.2f}（{unit}；報價時間 {updated} UTC）")
+            sources.append("Gold API")
+        except Exception:
+            logging.exception("Market price fetch failed: %s",symbol)
+            lines.append(f"{label}：暫時無法取得（不顯示推測價格）")
+    insights=[]
+    with db() as c:
+        for k,value in values.items():
+            row=c.execute("SELECT v FROM state WHERE k=?",(f"market_last_{k}",)).fetchone()
+            if row:
+                try:
+                    earlier=json.loads(row["v"])
+                    old=float(earlier["price"])
+                    old_date=earlier["date"]
+                    if old>0 and old_date!=now().strftime("%Y-%m-%d"):
+                        delta=(value/old-1)*100
+                        trend="上升" if delta>0 else "下降" if delta<0 else "持平"
+                        insights.append(f"{k}：較上次晨報{trend} {abs(delta):.2f}%（比較基準 {old_date}，非24小時漲跌）")
+                except (KeyError,ValueError,TypeError,ZeroDivisionError):
+                    pass
+            c.execute("INSERT INTO state(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                      (f"market_last_{k}",json.dumps({"price":value,"date":now().strftime("%Y-%m-%d")})))
+    lines.append("\n🔎 簡短分析")
+    if insights:
+        lines.extend("• "+insight for insight in insights)
+        lines.append("• 美元、黃金與比特幣風險性質不同，單日變化不代表長期趨勢。")
+    else:
+        lines.append("• 首次建立比較基準；下一個交易日／下一次晨報起顯示漲跌百分比。")
+        lines.append("• 黃金以美元／金衡盎司計價；比特幣波動通常較大，注意風險。")
+    lines.append("\n📌 匯率為參考價，不等於銀行現鈔買賣價。不同市場更新時段不同，休市可能沿用前次報價。")
+    lines.append("資料來源："+("、".join(dict.fromkeys(sources)) if sources else "來源暫時無回應")+"；不是投資建議。")
+    return "\n".join(lines)
+
 def record(role,content):
     with db() as c:
         c.execute("INSERT INTO history(role,content) VALUES(?,?)",(role,content[:1200]))
@@ -150,6 +218,29 @@ def message(cid,txt):
         send(cid,"你好！我是你的 AI 私人小秘書 💙\n直接問我問題，或說「明天下午三點提醒我打給廠商」。\n/list 查看待辦；/help 看指令。");return
     if txt=="/help":
         send(cid,"/list 查行程\n/monthly 查每月提醒\n/test 即時推播測試\n/testremind 1分鐘後推播測試\n/monthlyadd 15 11 繳停車費  新增每月15號11點提醒\n/monthlydelete 10001  刪除每月提醒\n/done 3 完成編號3的事項\n/id 查 Telegram ID\n重要單次提醒每30分鐘催辦直到完成。");return
+    if txt=="/market":
+        send(cid,daily_market_report());return
+    if txt in ("/marketoff","/marketon"):
+        enabled="0" if txt=="/marketoff" else "1"
+        with db() as c:
+            c.execute("INSERT INTO state(k,v) VALUES('market_enabled',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",(enabled,))
+        send(cid,"✅ 每天市場晨報已"+("暫停。" if enabled=="0" else "啟用，時間 "+market_time()+"。"));return
+    m=re.fullmatch(r"/markettime\\s+([01]?\\d|2[0-3]):([0-5]\\d)",txt)
+    if m:
+        newtime=f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+        with db() as c:
+            c.execute("INSERT INTO state(k,v) VALUES('market_time',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",(newtime,))
+        send(cid,"✅ 市場晨報已改為每天 "+newtime+"（台灣時間）");return
+    if ("美金" in txt or "美元" in txt or "黃金" in txt or "比特幣" in txt) and ("每天" in txt or "每日" in txt or "早上" in txt or "時間改" in txt or "改成" in txt) and ("點" in txt or ":" in txt):
+        match=re.search(r"(?:上午|早上|每天|每日)?\\s*(\\d{1,2})\\s*[點:]\\s*(\\d{1,2})?",txt)
+        if match:
+            hr=int(match.group(1));minute=int(match.group(2) or 0)
+            if 0<=hr<=23 and 0<=minute<=59:
+                nt=f"{hr:02d}:{minute:02d}"
+                with db() as c:
+                    c.execute("INSERT INTO state(k,v) VALUES('market_time',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",(nt,))
+                    c.execute("INSERT INTO state(k,v) VALUES('market_enabled','1') ON CONFLICT(k) DO UPDATE SET v=excluded.v")
+                send(cid,"✅ 美金、黃金、比特幣的每日價格與簡短分析，已設定每天 "+nt+"（台灣時間）。");return
     if txt=="/test":
         send(cid,"✅ Telegram 推播測試成功！這則訊息不需要 Gemini，也不會新增待辦。");return
     if txt=="/testremind":
@@ -158,6 +249,8 @@ def message(cid,txt):
             n=c.execute("INSERT INTO tasks(title,due,important) VALUES(?,?,0)",
                         ("🔔 一分鐘後提醒測試（只發送一次）",stamp(due))).lastrowid
         send(cid,f"✅ 測試提醒已排定，約一分鐘後推播。編號 #{n}");return
+    if txt in ("每日市場","每日市場分析","美金黃金比特幣","每日價格","市場晨報","價格分析"):
+        send(cid,daily_market_report());return
     if txt=="/monthly":
         send(cid,"📅 每月固定提醒\n"+monthly_status());return
     if any(p in txt for p in ("沒有完成","沒完成","持續提醒","一直提醒","繼續提醒")):
@@ -281,6 +374,18 @@ def scheduler():
         if t.hour>=8 and (not v or v["v"]!=t.strftime("%Y-%m-%d")):
             send(OWNER,"🌞 今日待辦總覽\n"+agenda())
             c.execute("INSERT INTO state(k,v) VALUES('daily',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",(t.strftime("%Y-%m-%d"),))
+    # One market report per Taiwan calendar date; retry on next polling loop if send fails.
+    with db() as c:
+        en=c.execute("SELECT v FROM state WHERE k='market_enabled'").fetchone()
+        last=c.execute("SELECT v FROM state WHERE k='market_sent'").fetchone()
+    at=market_time()
+    if (not en or en["v"]=="1") and (not last or last["v"]!=t.strftime("%Y-%m-%d")) and t.strftime("%H:%M")>=at:
+        try:
+            send(OWNER,daily_market_report())
+            with db() as c:
+                c.execute("INSERT INTO state(k,v) VALUES('market_sent',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",(t.strftime("%Y-%m-%d"),))
+        except Exception:
+            logging.exception("Market report send failed")
     # Persist a separate occurrence for each calendar month, independent of Gemini.
     period=t.strftime("%Y-%m")
     with db() as c:
