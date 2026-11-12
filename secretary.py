@@ -225,14 +225,14 @@ def message(cid,txt):
         with db() as c:
             c.execute("INSERT INTO state(k,v) VALUES('market_enabled',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",(enabled,))
         send(cid,"✅ 每天市場晨報已"+("暫停。" if enabled=="0" else "啟用，時間 "+market_time()+"。"));return
-    m=re.fullmatch(r"/markettime\\s+([01]?\\d|2[0-3]):([0-5]\\d)",txt)
+    m=re.fullmatch(r"/markettime\s+([01]?\d|2[0-3]):([0-5]\d)",txt)
     if m:
         newtime=f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
         with db() as c:
             c.execute("INSERT INTO state(k,v) VALUES('market_time',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",(newtime,))
         send(cid,"✅ 市場晨報已改為每天 "+newtime+"（台灣時間）");return
     if ("美金" in txt or "美元" in txt or "黃金" in txt or "比特幣" in txt) and ("每天" in txt or "每日" in txt or "早上" in txt or "時間改" in txt or "改成" in txt) and ("點" in txt or ":" in txt):
-        match=re.search(r"(?:上午|早上|每天|每日)?\\s*(\\d{1,2})\\s*[點:]\\s*(\\d{1,2})?",txt)
+        match=re.search(r"(?:上午|早上|每天|每日)?\s*(\d{1,2})\s*[點:]\s*(\d{1,2})?",txt)
         if match:
             hr=int(match.group(1));minute=int(match.group(2) or 0)
             if 0<=hr<=23 and 0<=minute<=59:
